@@ -65,6 +65,40 @@ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
+def beam_sample_topk(
+    logits: torch.Tensor,
+    num_candidates: int,
+    temperatures: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-row top-``num_candidates`` next tokens and their log-probabilities.
+
+    Used by beam search: each of the W current beams (one row of ``logits``) proposes
+    its ``num_candidates`` best continuations, which the beam selector then combines
+    across beams and prunes back to W. Returning ``2 * W`` candidates per beam
+    guarantees at least W non-EOS continuations survive per group even if some of the
+    best candidates are EOS.
+
+    Unlike :meth:`Sampler.forward`, this returns the *distribution's* top-W rather than
+    a single sampled token, and the score it returns is the log-probability (so beam
+    scores accumulate as a sum of log-probs).
+
+    Args:
+        logits: ``[num_rows, vocab]`` next-token logits (``num_rows = num_groups * W``).
+        num_candidates: number of candidate tokens to return per row (typically ``2 * W``).
+        temperatures: optional ``[num_rows, 1]`` (broadcastable) temperatures applied
+            before the softmax. ``None`` means no scaling.
+
+    Returns:
+        ``(topk_tokens, topk_logprobs)`` each ``[num_rows, num_candidates]``, sorted by
+        descending log-probability per row. ``topk_tokens`` is ``int64``.
+    """
+    if temperatures is not None:
+        logits = logits / temperatures
+    logprobs = torch.log_softmax(logits, dim=-1)
+    topk_logprobs, topk_tokens = torch.topk(logprobs, num_candidates, dim=-1)
+    return topk_tokens, topk_logprobs
+
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -89,6 +123,24 @@ class Sampler(nn.Module):
             apply_custom_logit_processor(logits, sampling_info)
         sanitize_nan_logits(logits, "sampler: next_token_logits")
         return logits
+
+    def forward_beam(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        num_candidates: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Beam-search sampling: per-row top-``num_candidates`` tokens + log-probs.
+
+        This is the beam-search counterpart of :meth:`forward`. It reuses the custom
+        logit processors / NaN handling from :meth:`_preprocess_logits`, then delegates
+        to :func:`beam_sample_topk`. The cross-beam selection (W*C -> top-W with
+        back-pointers) lives in the beam search manager, not here.
+        """
+        logits = self._preprocess_logits(
+            logits_output.next_token_logits, sampling_info
+        )
+        return beam_sample_topk(logits, num_candidates, sampling_info.temperatures)
 
     def forward(
         self,

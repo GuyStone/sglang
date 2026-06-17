@@ -83,6 +83,9 @@ class SamplingParams:
         repetition_penalty: float = 1.0,
         min_new_tokens: int = 0,
         n: int = 1,
+        num_beams: int = 1,
+        length_penalty: float = 1.0,
+        early_stopping: Union[bool, str] = False,
         json_schema: Optional[str] = None,
         regex: Optional[str] = None,
         ebnf: Optional[str] = None,
@@ -122,6 +125,11 @@ class SamplingParams:
         self.min_new_tokens = min_new_tokens if min_new_tokens is not None else 0
         self.regex = regex
         self.n = n if n is not None else 1
+        # Beam search. num_beams == 1 disables beam search (default behavior).
+        # When num_beams > 1, `n` is the number of (top-scoring) hypotheses to return.
+        self.num_beams = num_beams if num_beams is not None else 1
+        self.length_penalty = length_penalty if length_penalty is not None else 1.0
+        self.early_stopping = early_stopping if early_stopping is not None else False
         self.json_schema = json_schema
         self.ebnf = ebnf
         self.structural_tag = structural_tag
@@ -142,9 +150,13 @@ class SamplingParams:
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
-            # top_k = 1 means greedy sampling
+            # Avoid dividing logits by ~0. For plain sampling, temperature ~ 0 means
+            # greedy (top_k = 1). For beam search we must keep the full vocabulary so
+            # the top-W expansion has candidates to choose from, so only the
+            # temperature is neutralized (raw logits) and top_k is left untouched.
             self.temperature = 1.0
-            self.top_k = 1
+            if self.num_beams <= 1:
+                self.top_k = 1
         if self.top_k == -1:
             self.top_k = TOP_K_ALL  # whole vocabulary
 
@@ -205,6 +217,43 @@ class SamplingParams:
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
             raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+
+        self._verify_beam_search(vocab_size, grammars)
+
+    def _verify_beam_search(self, vocab_size, grammars):
+        """Validate beam-search-specific constraints.
+
+        Beam search performs a deterministic top-W expansion, so it is incompatible
+        with stochastic nucleus filters (top_p / top_k / min_p). Temperature is allowed
+        (it is a monotone rescaling of the logits used to compute scores).
+        """
+        if self.num_beams < 1:
+            raise ValueError(f"num_beams must be at least 1, got {self.num_beams}.")
+        if self.num_beams == 1:
+            return
+
+        if not 1 <= self.n <= self.num_beams:
+            raise ValueError(
+                f"When using beam search, n (number of returned hypotheses) must be "
+                f"in [1, num_beams({self.num_beams})], got {self.n}."
+            )
+        # top_k has already been normalized: -1 -> TOP_K_ALL above.
+        if self.top_p < 1.0 or self.min_p > 0.0 or self.top_k != TOP_K_ALL:
+            raise ValueError(
+                "Beam search is incompatible with top_p / top_k / min_p sampling; "
+                "the beam expansion is itself a top-W operation. Leave them at their "
+                "defaults (top_p=1.0, top_k=-1, min_p=0.0)."
+            )
+        if self.early_stopping not in (True, False, "never"):
+            raise ValueError(
+                "early_stopping must be one of True, False, or 'never', got "
+                f"{self.early_stopping!r}."
+            )
+        if any(x is not None for x in grammars) or self.structural_tag is not None:
+            raise ValueError(
+                "Beam search does not yet support grammar / structured output "
+                "(json_schema, regex, ebnf, structural_tag)."
+            )
 
     def normalize(self, tokenizer):
         # Process stop strings
