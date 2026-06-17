@@ -21,6 +21,12 @@ import torch
 from sglang.srt.layers.attention.cascade import cascade_attend, merge_attn_states
 from sglang.srt.layers.sampler import beam_sample_topk
 from sglang.srt.managers.beam_search import BeamGroup, BeamSearchManager
+from sglang.srt.managers.beam_search_runtime import (
+    apply_beam_row_reorder,
+    compute_beam_row_reorder,
+    orphan_free_slots,
+    run_beam_decode_step,
+)
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 
 torch.manual_seed(0)
@@ -418,6 +424,88 @@ class TestBeamGroupMechanics(unittest.TestCase):
         self.assertEqual(out.next_tokens.shape, (2,))
         mgr.remove("r1")
         self.assertNotIn("r1", mgr)
+
+
+class TestBeamRowReorder(unittest.TestCase):
+    def test_compute_reorder_indices(self):
+        # group0 parents [0,0,1], group1 parents [2,1,1], W=3
+        parent_ptr = torch.tensor([[0, 0, 1], [2, 1, 1]], dtype=torch.int64)
+        plan = compute_beam_row_reorder(parent_ptr, beam_width=3)
+        # global src rows: g0 offset 0 -> [0,0,1]; g1 offset 3 -> [5,4,4]
+        self.assertEqual(plan.src_rows.tolist(), [0, 0, 1, 5, 4, 4])
+        # parent == self: g0 [T,F,F], g1 [F,T,F]
+        self.assertEqual(plan.in_place.tolist(), [True, False, False, False, True, False])
+        # g0 references {0,1} -> beam 2 orphaned (row 2); g1 references {1,2} -> beam 0 (row 3)
+        self.assertEqual(plan.free_beam_rows.tolist(), [2, 3])
+
+    def test_apply_reorder_is_hazard_free(self):
+        # 2 groups x W=3 = 6 beam rows; give each a distinct req_to_token row.
+        W, num_groups, ctx, hist = 3, 2, 8, 4
+        pool = 6
+        beam_pool_indices = torch.arange(pool, dtype=torch.int64)
+        req_to_token = torch.zeros(pool, ctx, dtype=torch.int64)
+        for r in range(pool):
+            req_to_token[r, :hist] = torch.arange(hist) + r * 100  # recognizable
+        original = req_to_token.clone()
+        parent_ptr = torch.tensor([[0, 0, 1], [2, 1, 1]], dtype=torch.int64)
+        plan = compute_beam_row_reorder(parent_ptr, W)
+        apply_beam_row_reorder(req_to_token, beam_pool_indices, plan, hist)
+        # each row i now equals the ORIGINAL content of src_rows[i] (hazard-free)
+        for i in range(pool):
+            src = plan.src_rows[i].item()
+            self.assertTrue(
+                torch.equal(req_to_token[i, :hist], original[src, :hist]),
+                f"row {i} should mirror src {src}",
+            )
+
+    def test_orphan_free_slots(self):
+        parent_ptr = torch.tensor([[0, 0, 1], [2, 1, 1]], dtype=torch.int64)
+        plan = compute_beam_row_reorder(parent_ptr, 3)
+        out_cache_loc = torch.tensor([100, 101, 102, 103, 104, 105], dtype=torch.int64)
+        self.assertEqual(orphan_free_slots(plan, out_cache_loc).tolist(), [102, 103])
+
+    def test_fanout_reorder_all_point_to_beam0(self):
+        # First decode step: every survivor continues beam 0 -> rows 1..W-1 orphaned.
+        parent_ptr = torch.zeros(2, 4, dtype=torch.int64)  # 2 groups, W=4
+        plan = compute_beam_row_reorder(parent_ptr, 4)
+        self.assertEqual(plan.src_rows.tolist(), [0, 0, 0, 0, 4, 4, 4, 4])
+        self.assertEqual(plan.free_beam_rows.tolist(), [1, 2, 3, 5, 6, 7])
+
+
+class TestRunBeamDecodeStep(unittest.TestCase):
+    def test_first_step_matches_per_group(self):
+        W, num_groups, vocab = 3, 2, 12
+        mgr = BeamSearchManager()
+        rids = ["g0", "g1"]
+        for rid in rids:
+            mgr.add(rid, beam_width=W, num_return=W, eos_token_ids=[], max_new_tokens=5)
+        torch.manual_seed(3)
+        logits = torch.randn(num_groups * W, vocab, dtype=torch.float64)
+        topk_tokens, topk_logprobs = beam_sample_topk(logits, num_candidates=2 * W)
+        res = run_beam_decode_step(mgr, rids, topk_tokens, topk_logprobs, W)
+        # fan-out: every beam continues beam 0
+        self.assertEqual(res.parent_ptr.tolist(), [[0, 0, 0], [0, 0, 0]])
+        self.assertEqual(res.reorder_plan.src_rows.tolist(), [0, 0, 0, 3, 3, 3])
+        # per group, next tokens are the top-W of that group's row-0 distribution
+        for g in range(num_groups):
+            ref = torch.topk(torch.log_softmax(logits[g * W], -1), W).indices.tolist()
+            got = res.next_tokens[g * W : (g + 1) * W].tolist()
+            self.assertEqual(sorted(got), sorted(ref))
+        self.assertEqual(res.next_tokens.shape, (num_groups * W,))
+        self.assertEqual(list(res.finished), [False, False])
+
+    def test_second_step_backpointers_in_range(self):
+        W, vocab = 4, 16
+        mgr = BeamSearchManager()
+        mgr.add("g", beam_width=W, num_return=W, eos_token_ids=[], max_new_tokens=5)
+        torch.manual_seed(5)
+        for step in range(2):
+            logits = torch.randn(W, vocab, dtype=torch.float64)
+            tk, tl = beam_sample_topk(logits, 2 * W)
+            res = run_beam_decode_step(mgr, ["g"], tk, tl, W)
+        self.assertEqual(res.parent_ptr.shape, (1, W))
+        self.assertTrue(0 <= int(res.parent_ptr.min()))
+        self.assertTrue(int(res.parent_ptr.max()) < W)
 
 
 if __name__ == "__main__":

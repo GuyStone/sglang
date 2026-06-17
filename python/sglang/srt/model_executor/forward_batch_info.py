@@ -100,6 +100,11 @@ class ForwardMode(IntEnum):
     # Used in dLLM
     DLLM_EXTEND = auto()
 
+    # Beam search decode: one new token per beam, W beams per request sharing a
+    # prefix. Behaves like DECODE (q_len=1 per row) but triggers cascade attention
+    # over the shared prefix. Beam metadata rides on ForwardBatch.spec_info.
+    BEAM_DECODE = auto()
+
     def is_prefill(self, include_draft_extend_v2: bool = False):
         return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
 
@@ -125,7 +130,10 @@ class ForwardMode(IntEnum):
         )
 
     def is_decode(self):
-        return self == ForwardMode.DECODE
+        return self == ForwardMode.DECODE or self == ForwardMode.BEAM_DECODE
+
+    def is_beam_decode(self):
+        return self == ForwardMode.BEAM_DECODE
 
     def is_mixed(self):
         return self == ForwardMode.MIXED
@@ -154,6 +162,7 @@ class ForwardMode(IntEnum):
     def is_cuda_graph(self):
         return (
             self == ForwardMode.DECODE
+            or self == ForwardMode.BEAM_DECODE
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.IDLE
             or self == ForwardMode.DLLM_EXTEND

@@ -157,6 +157,9 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        # Beam search width. 0 disables beam decode (the default). When > 1, BEAM_DECODE
+        # batches reuse the same two-pass cascade machinery as spec-decode topk>1.
+        self.beam_width = 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -377,12 +380,71 @@ class FlashAttentionBackend(AttentionBackend):
                 out_cache_loc=out_cache_loc,
             )
 
+    def _init_beam_decode_metadata(
+        self, forward_batch: ForwardBatch, metadata: "FlashAttentionMetadata"
+    ):
+        """Build two-pass cascade metadata for a beam-decode step.
+
+        Mirrors the spec-decode ``topk > 1`` decode path, with the beam width in place of
+        ``topk``:
+
+        * Pass 1 (``metadata``): the W beams of each request attend their **shared
+          committed prefix** ``[0, D_g)`` — one page-table row per group, W queries per
+          group (``cu_seqlens_q`` stepped by W). Computed once per group.
+        * Pass 2 (``self.forward_metadata_spec_decode_expand``): each beam attends its own
+          **divergent tail** ``[D_g, L)`` — one query per beam.
+
+        The existing ``forward_decode`` two-pass + ``merge_state_v2`` block consumes both.
+
+        Beam geometry is carried on ``forward_batch.spec_info`` as a ``BeamDecodeInput``
+        (see ``managers/beam_search_runtime.py``); duck-typed here to avoid a
+        layers→managers import cycle. NOT yet runtime-validated end to end.
+        """
+        beam = forward_batch.spec_info
+        device = forward_batch.seq_lens.device
+        W = self.beam_width
+        num_groups = beam.prefix_lens.numel()
+
+        # Pass 1: shared committed prefix, W queries per group.
+        metadata.cache_seqlens_int32 = beam.prefix_lens.to(torch.int32)
+        metadata.max_seq_len_q = W
+        metadata.max_seq_len_k = int(beam.prefix_lens.max().item())
+        metadata.cu_seqlens_q = torch.arange(
+            0, num_groups * W + 1, step=W, dtype=torch.int32, device=device
+        )
+        metadata.cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
+        )
+        metadata.page_table = beam.prefix_page_table[:, : metadata.max_seq_len_k]
+
+        # Pass 2: per-beam divergent tail, one query per beam.
+        expand = FlashAttentionMetadata()
+        expand.cache_seqlens_int32 = beam.tail_lens.to(torch.int32)
+        expand.max_seq_len_q = 1
+        expand.cu_seqlens_q = torch.arange(
+            0, num_groups * W + 1, dtype=torch.int32, device=device
+        )
+        expand.cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(expand.cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
+        )
+        expand.page_table = beam.tail_page_table
+        self.forward_metadata_spec_decode_expand = expand
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
+
+        if forward_batch.forward_mode.is_beam_decode():
+            # Beam search decode: build the shared-prefix + per-beam-tail cascade
+            # metadata, then return. Isolated from the spec/normal decode paths below.
+            # NOTE: not yet runtime-validated end to end (requires the scheduler beam
+            # wiring; see benchmark/beam_search_cascade/INTEGRATION.md).
+            self._init_beam_decode_metadata(forward_batch, metadata)
+            self.forward_metadata = metadata
+            return
 
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
@@ -1351,7 +1413,12 @@ class FlashAttentionBackend(AttentionBackend):
         # When Spec Decode enabled, forward_decode would be called with two mode:
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
         # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
-        use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
+        # Beam search reuses the same two-pass cascade path: the W beams of a request
+        # share a committed prefix (pass 1) and diverge in short tails (pass 2). Inert
+        # for non-beam batches (beam_width == 0 / not BEAM_DECODE).
+        use_cascade_attn = (forward_batch.spec_info is not None and self.topk > 1) or (
+            forward_batch.forward_mode.is_beam_decode() and self.beam_width > 1
+        )
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
