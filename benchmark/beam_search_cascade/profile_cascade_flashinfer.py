@@ -33,7 +33,7 @@ DTYPE = torch.float16
 HQ, HKV, HEAD_DIM, NLAYERS = 16, 8, 128, 28
 PAGE = 1  # SGLang default page size
 SCALE = 1.0 / (HEAD_DIM ** 0.5)
-WS = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=DEV)
+WS = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=DEV)
 
 
 def plan_cascade(P, W, T):
@@ -118,26 +118,42 @@ def main():
         ("sweep T     P=2000 W=30 T=60", 2000, 30, 60),
         ("sweep P     P=4000 W=30 T=5", 4000, 30, 5),
         ("sweep P     P=8000 W=30 T=5", 8000, 30, 5),
+        # Very wide beams: replicate's per-layer KV (and especially x28-layer KV)
+        # explodes; cascade stays tiny. At W>=100 the full-model replicate KV alone
+        # exceeds a single GPU, so cascade is what makes ultra-wide beams feasible.
+        ("wide W      P=2000 W=100 T=5", 2000, 100, 5),
+        ("wide W      P=2000 W=250 T=5", 2000, 250, 5),
+        ("wide W      P=2000 W=500 T=5", 2000, 500, 5),
+        ("wide W      P=4000 W=500 T=5", 4000, 500, 5),
     ]
     bpp = bytes_per_page()
-    hdr = (f"{'config':32} | {'casc(ms)':>8} {'repl(ms)':>8} {'speedup':>7}"
-           f" | {'KV casc':>9} {'KV repl':>9} {'mem x':>6}")
+    hdr = (f"{'config':32} | {'casc(ms)':>8} {'repl(ms)':>9} {'speedup':>7}"
+           f" | {'KV casc':>8} {'KV repl':>9} {'mem x':>6} | {'repl x28L':>9}")
     print(hdr)
     print("-" * len(hdr))
     for name, P, W, T in configs:
         q = torch.randn(W, HQ, HEAD_DIM, device=DEV, dtype=DTYPE)
         casc, kv_c, pg_c = plan_cascade(P, W, T)
-        rep, kv_r, pg_r = plan_replicate(P, W, T)
         t_c = time_run(casc, q, kv_c)
-        t_r = time_run(rep, q, kv_r)
-        mem_c, mem_r = pg_c * bpp / 1e6, pg_r * bpp / 1e6
-        print(f"{name:32} | {t_c:>8.4f} {t_r:>8.4f} {t_r/t_c:>6.2f}x"
-              f" | {mem_c:>7.1f}M {mem_r:>7.1f}M {mem_r/mem_c:>5.1f}x")
-        del casc, rep, kv_c, kv_r
+        mem_c = pg_c * bpp / 1e6
+        try:
+            rep, kv_r, pg_r = plan_replicate(P, W, T)
+            t_r = time_run(rep, q, kv_r)
+            mem_r = pg_r * bpp / 1e6
+            full_r = pg_r * bpp * NLAYERS / 1e9
+            cols = (f"{t_r:>9.4f} {t_r/t_c:>6.2f}x | {mem_c:>6.1f}M {mem_r:>8.1f}M "
+                    f"{mem_r/mem_c:>5.0f}x | {full_r:>7.1f}GB")
+            del rep, kv_r
+        except torch.cuda.OutOfMemoryError:
+            cols = f"{'OOM':>9} {'--':>7} | {mem_c:>6.1f}M {'OOM':>8} {'--':>5} | {'OOM':>9}"
+            torch.cuda.empty_cache()
+        print(f"{name:32} | {t_c:>8.4f} {cols}")
+        del casc, kv_c
         torch.cuda.empty_cache()
 
     print(f"\nLatency is per attention call (one layer). A full decode step does "
-          f"{NLAYERS} layers; KV memory shown is per layer (x{NLAYERS} for the model).")
+          f"{NLAYERS} layers; 'repl x28L' is the full-model replicate KV cache for one "
+          f"step (the L4 has 23 GB). Cascade's full-model KV stays well under 1 GB.")
 
     # ---- kernel breakdown (profile to understand what runs) ----
     print("\n=== torch.profiler kernel breakdown: P=2000 W=30 T=5 ===")

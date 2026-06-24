@@ -85,6 +85,28 @@ Per attention call (one layer); cascade == replicate verified to 5e-4.
   SGLang FA3/FlashInfer backends already implement for spec-decode `topk>1` and that the beam
   hook reuses.
 
+### Very wide beams (W up to 500)
+
+Pushing beam width far past LPM's 30 (same L4, P=2000, T=5):
+
+| W | cascade | replicate | speedup | KV repl/layer | full-model repl KV (×28) |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 0.16 ms | 0.05 ms | 0.3× | 8.2 MB | 0.2 GB |
+| 30 | 0.16 ms | 0.99 ms | 6.3× | 246 MB | 6.9 GB |
+| 100 | 0.16 ms | 3.26 ms | 20.8× | 821 MB | **23.0 GB** |
+| 250 | 0.21 ms | 8.17 ms | 39.6× | 2.05 GB | 57.5 GB |
+| **500** | 0.38 ms | 16.4 ms | **43.4×** | 4.11 GB | **115 GB** |
+| 500 (P=4000) | 0.58 ms | 32.7 ms | **56.8×** | 8.2 GB | 230 GB |
+
+At very wide beams cascade is not just an optimization — it is what makes the workload
+**possible at all**. The full-model replicate KV cache (×28 layers) for one decode step is
+**115 GB at W=500 / P=2000** (230 GB at P=4000), versus the L4's 23 GB; even W=100 (23 GB)
+already fills the GPU. Cascade's full-model KV stays **~0.5 GB** at W=500, because the
+2000-token prefix is stored once instead of 500 times. Cascade latency does begin to climb
+past W≈250 (level-0 becomes a 500-query prefill over the prefix), but the speedup keeps
+growing because replicate scales with `W·(P+T)`. Run the sweep:
+`python benchmark/beam_search_cascade/profile_cascade_flashinfer.py`.
+
 ### Why this can't be run as a full `lpm-benchmark` here
 `lpm-benchmark` drives `lpm-loader` against a *running* server (`engines/sglang/run_benchmark.sh`
 → `python -m sglang.launch_server` + `lpm-loader suite localhost:8000 --backend http`). That
