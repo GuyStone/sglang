@@ -42,6 +42,57 @@ the W beams — exactly FlashInfer's `merge_state` two-pass / `sgl_kernel`'s
 (`flashattention_backend.py`). The implementation must therefore route beam decode through
 that fused path, not a naive two-pass.
 
+## Real fused-kernel results (`profile_cascade_flashinfer.py`)
+
+The microbenchmark above uses a naive same-kernel attention, so it only shows the KV-memory
+win. To measure the **latency** win you need the production fused kernel. This script runs
+FlashInfer's actual `MultiLevelCascadeAttentionWrapper` (cascade) vs
+`BatchDecodeWithPagedKVCacheWrapper` (replicate) — the kernels SGLang itself uses — at
+`lpm-benchmark`'s beam-search workload shapes (`profiles/qwen3_17b_beam_search.yaml`:
+prompt ~2000, beam width 15/30, short output) with Qwen3-1.7B attention dims.
+
+```
+python benchmark/beam_search_cascade/profile_cascade_flashinfer.py
+```
+
+### NVIDIA L4, Qwen3-1.7B dims (Hq=16, Hkv=8, D=128), fp16, page_size=1
+
+Per attention call (one layer); cascade == replicate verified to 5e-4.
+
+| workload | cascade | replicate | **latency speedup** | KV mem (per layer) | mem saving |
+|---|--:|--:|--:|--:|--:|
+| `bw1_6k`  P=6031 W=1  T=60 | 0.154 ms | 0.045 ms | **0.29× (slower)** | 24.9 / 24.9 MB | 1.0× |
+| `bw15_2k` P=2000 W=15 T=5  | 0.152 ms | 0.500 ms | **3.30×** | 8.5 / 123 MB | 14.5× |
+| `bw30_2k` P=2000 W=30 T=5  | 0.153 ms | 0.988 ms | **6.45×** | 8.8 / 246 MB | 28× |
+| P=2000 W=30 T=60 | 0.153 ms | 1.017 ms | 6.66× | 15.6 / 253 MB | 16× |
+| P=4000 W=30 T=5  | 0.151 ms | 1.959 ms | **13.0×** | 17 / 492 MB | 29× |
+| P=8000 W=30 T=5  | 0.151 ms | 3.898 ms | **25.9×** | 33 / 984 MB | 29.5× |
+
+**Findings**
+- **Cascade latency is ~flat (~0.15 ms)** across beam width, tail length, and prefix length —
+  the shared prefix KV is read *once*. Replicate scales with `W·(P+T)`, so the cascade win
+  *grows* with beam width and prompt length (6.5× at W=30/P=2000 → 26× at P=8000).
+- **Gate cascade on `beam_width > 1`.** At W=1 cascade is **3.4× slower** (two-pass + LSE
+  merge overhead with nothing to share). SGLang's existing `use_cascade_attn` predicate (and
+  the beam hook added here) already require width > 1 — keep that.
+- **KV memory** drops ~`W×` for the prefix (stored once): at W=30/P=2000 that's 246 MB → 8.8 MB
+  *per layer* (×28 layers: ~6.9 GB → ~246 MB per step). This is what makes wide beams feasible
+  without OOM, independent of the latency win.
+- **Kernel breakdown** (torch profiler): cascade = two `BatchPrefillWithPagedKVCacheKernel`
+  (level-0 shared prefix + level-1 per-beam tail) + `PersistentVariableLengthMergeStates`
+  (the LSE merge); replicate = one `BatchDecodeWithPagedKVCacheKernel` that is 99.5% of the
+  time (980 µs at W=30). The cascade path is exactly the two-pass + `merge_state` that the
+  SGLang FA3/FlashInfer backends already implement for spec-decode `topk>1` and that the beam
+  hook reuses.
+
+### Why this can't be run as a full `lpm-benchmark` here
+`lpm-benchmark` drives `lpm-loader` against a *running* server (`engines/sglang/run_benchmark.sh`
+→ `python -m sglang.launch_server` + `lpm-loader suite localhost:8000 --backend http`). That
+needs (1) SGLang running on the GPU — blocked by the CUDA stack below; (2) beam search wired
+end-to-end in SGLang — the scheduler glue in `INTEGRATION.md` is not yet landed; and (3)
+`lpm-loader` from Spotify Artifactory. This script profiles the performance-critical kernel
+directly at the same workload shapes, which is what determines the end-to-end beam-search win.
+
 ## Environment note
 
 The pinned sglang 0.5.12 native stack (`torch 2.11.0+cu130`, `sgl-kernel 0.3.21+cu130`,
